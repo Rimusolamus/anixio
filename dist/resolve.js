@@ -5,6 +5,7 @@ exports.resolveToAnixart = resolveToAnixart;
 const anixapi_1 = require("anixapi");
 const client = new anixapi_1.Anixart({});
 const CINEMETA_BASE = "https://v3-cinemeta.strem.io";
+const FETCH_TIMEOUT_MS = 8_000;
 function parseImdbId(id) {
     const match = id.match(/^(tt\d+)(?::(\d+):(\d+))?$/);
     if (!match)
@@ -18,7 +19,7 @@ function parseImdbId(id) {
 async function fetchCinemetaMeta(type, imdbId) {
     try {
         const url = `${CINEMETA_BASE}/meta/${type}/${imdbId}.json`;
-        const resp = await fetch(url);
+        const resp = await fetch(url, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
         if (!resp.ok)
             return null;
         const data = (await resp.json());
@@ -171,6 +172,7 @@ async function fetchAnilistRomaji(title) {
     try {
         const resp = await fetch("https://graphql.anilist.co", {
             method: "POST",
+            signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
                 query: `query($s: String){Media(search:$s,type:ANIME){title{romaji}}}`,

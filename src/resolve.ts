@@ -4,6 +4,7 @@ import type { ContentType } from "stremio-addon-sdk";
 const client = new Anixart({});
 
 const CINEMETA_BASE = "https://v3-cinemeta.strem.io";
+const FETCH_TIMEOUT_MS = 8_000;
 
 interface CinemetaMeta {
   meta: {
@@ -27,7 +28,7 @@ function parseImdbId(id: string): { baseId: string; episode?: number; season?: n
 async function fetchCinemetaMeta(type: ContentType, imdbId: string): Promise<{ name: string; year: number | null } | null> {
   try {
     const url = `${CINEMETA_BASE}/meta/${type}/${imdbId}.json`;
-    const resp = await fetch(url);
+    const resp = await fetch(url, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
     if (!resp.ok) return null;
     const data = (await resp.json()) as CinemetaMeta;
     const name = data.meta?.name;
@@ -193,6 +194,7 @@ async function fetchAnilistRomaji(title: string): Promise<string | null> {
   try {
     const resp = await fetch("https://graphql.anilist.co", {
       method: "POST",
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         query: `query($s: String){Media(search:$s,type:ANIME){title{romaji}}}`,
