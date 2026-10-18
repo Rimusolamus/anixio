@@ -1,48 +1,33 @@
 import { Anixart, KodikParser, AniLibriaParser, SibnetParser } from "anixapi";
 import type { ContentType, Stream } from "stremio-addon-sdk";
-import { parseAnixartId, parseAnixartEpisodeId } from "./utils";
+import { parseAnixartId, parseAnixartEpisodeId, withTimeout, mapLimit, STEP_TIMEOUT_MS } from "./utils";
 import { resolveToAnixart } from "./resolve";
 
 const client = new Anixart({});
 
-// None of the upstream fetches (Anixart API, Kodik, Sibnet, AniLibria) carry a timeout and the
-// dubber walk used to be sequential, so one stalled source held the whole response well past
-// Stremio's patience. Every step is bounded and dubbers are fanned out instead.
-const STEP_TIMEOUT_MS = 8_000;
+// The dubber walk used to be sequential with no timeouts, so one stalled source held the whole
+// response well past Stremio's patience. Dubbers are fanned out, every step is bounded by
+// STEP_TIMEOUT_MS, and whatever has resolved by the deadline is returned.
 const RESPONSE_DEADLINE_MS = 20_000;
 const CONCURRENCY = 8;
 const MAX_STREAMS = 50;
 
-// ANIXIO_DEBUG=1 logs where the time goes for each stream request (phase timings, timeouts).
+// ANIXIO_DEBUG=1 logs where the time goes for each stream request (phase timings, misses).
 const DEBUG = process.env.ANIXIO_DEBUG === "1";
 const debug = (...parts: unknown[]) => { if (DEBUG) console.log("[stream]", ...parts); };
 
 interface Candidate {
-  order: number;
+  dubberIndex: number;
+  sourceIndex: number;
+  position: number;
   dubberId: number;
   label: string;
   url: string;
 }
 
-function withTimeout<T>(promise: Promise<T>, ms: number, fallback: T): Promise<T> {
-  return new Promise<T>((resolve) => {
-    const timer = setTimeout(() => resolve(fallback), ms);
-    promise.then(
-      (value) => { clearTimeout(timer); resolve(value); },
-      () => { clearTimeout(timer); resolve(fallback); },
-    );
-  });
-}
-
-async function mapLimit<T>(items: T[], limit: number, fn: (item: T, index: number) => Promise<void>): Promise<void> {
-  let next = 0;
-  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
-    while (next < items.length) {
-      const index = next++;
-      await fn(items[index], index);
-    }
-  });
-  await Promise.all(workers);
+// Anixart's own order: dubbers by popularity, then sources, then episodes.
+function byOrder(a: Candidate, b: Candidate): number {
+  return a.dubberIndex - b.dubberIndex || a.sourceIndex - b.sourceIndex || a.position - b.position;
 }
 
 function toDirectMp4(m3u8Url: string): string | null {
@@ -63,7 +48,7 @@ function fixUrl(url: string): string {
 // Anixart occasionally hands back the rest of an iframe tag after the URL, e.g.
 // `https://video.sibnet.ru/shell.php?videoid=123" frameborder="0" scrolling="no`.
 function cleanUrl(url: string): string {
-  return url.split(/["'\s]/)[0];
+  return url.trim().split(/["'\s]/)[0];
 }
 
 async function resolveStream(label: string, sourceUrl: string): Promise<Stream | null> {
@@ -116,50 +101,71 @@ async function resolveStream(label: string, sourceUrl: string): Promise<Stream |
 
 // Walks dubbers → sources → episodes and appends every matching episode to `out` as it is
 // found, so a deadline hit mid-walk still leaves the caller with whatever was collected.
-async function collectCandidates(releaseId: number, targetEpisode: number | null, out: Candidate[]): Promise<void> {
-  const typesResult = await withTimeout(client.endpoints.episode.types(releaseId), STEP_TIMEOUT_MS, null);
-  if (!typesResult) debug(releaseId, "types: failed or timed out");
+async function collectCandidates(
+  releaseId: number,
+  targetEpisode: number | null,
+  out: Candidate[],
+  expired: () => boolean,
+): Promise<void> {
+  const typesResult = await withTimeout(
+    client.endpoints.episode.types(releaseId),
+    STEP_TIMEOUT_MS,
+    null,
+    `anixart types(${releaseId})`,
+  );
   const dubbers = typesResult?.types || [];
 
   await mapLimit(dubbers, CONCURRENCY, async (dubber, dubberIndex) => {
-    const sourcesResult = await withTimeout(client.endpoints.episode.sources(releaseId, dubber.id), STEP_TIMEOUT_MS, null);
-    if (!sourcesResult) debug(releaseId, dubber.name, "sources: failed or timed out");
+    const sourcesResult = await withTimeout(
+      client.endpoints.episode.sources(releaseId, dubber.id),
+      STEP_TIMEOUT_MS,
+      null,
+      `anixart sources(${releaseId}, ${dubber.name})`,
+    );
     const sources = sourcesResult?.sources || [];
 
     for (const [sourceIndex, source] of sources.entries()) {
+      if (expired()) return;
+
       const episodesResult = await withTimeout(
         client.endpoints.episode.episodes(releaseId, dubber.id, source.id),
         STEP_TIMEOUT_MS,
         null,
+        `anixart episodes(${releaseId}, ${dubber.name}, ${source.name})`,
       );
-      if (!episodesResult) debug(releaseId, dubber.name, source.name, "episodes: failed or timed out");
       const episodes = episodesResult?.episodes || [];
 
       for (const ep of episodes) {
         if (targetEpisode !== null && ep.position !== targetEpisode) continue;
-        if (!ep.url) continue;
+        const url = ep.url ? cleanUrl(ep.url) : "";
+        if (!url) continue;
 
         const baseLabel = `${dubber.name} | ${source.name}`;
         out.push({
-          order: dubberIndex * 10_000 + sourceIndex * 1_000 + ep.position,
+          dubberIndex,
+          sourceIndex,
+          position: Number(ep.position) || 0,
           dubberId: dubber.id,
           label: ep.name ? `${baseLabel} — ${ep.name}` : baseLabel,
-          url: cleanUrl(ep.url),
+          url,
         });
       }
     }
-  });
+  }, expired);
 }
 
 export async function streamHandler(args: { type: ContentType; id: string }): Promise<{ streams: Stream[] }> {
   const started = Date.now();
-  const remaining = () => Math.max(1_000, RESPONSE_DEADLINE_MS - (Date.now() - started));
+  const deadline = started + RESPONSE_DEADLINE_MS;
+  const timeLeft = () => deadline - Date.now();
+  const expired = () => timeLeft() <= 0;
+  const elapsed = () => `after ${Date.now() - started} ms`;
 
   let episodeInfo = parseAnixartEpisodeId(args.id);
   let releaseId = episodeInfo?.releaseId ?? parseAnixartId(args.id);
 
   if (!releaseId) {
-    const resolved = await withTimeout(resolveToAnixart(args.type, args.id), remaining(), null);
+    const resolved = await withTimeout(resolveToAnixart(args.type, args.id), timeLeft(), null, `resolve ${args.id}`);
     if (resolved) {
       releaseId = resolved;
       const parsed = args.id.match(/:(\d+):(\d+)$/);
@@ -173,46 +179,49 @@ export async function streamHandler(args: { type: ContentType; id: string }): Pr
     }
   }
 
-  debug(args.id, "release", releaseId, "after", Date.now() - started, "ms");
-  if (!releaseId) return { streams: [] };
+  debug(args.id, "release", releaseId, elapsed());
+  if (!releaseId || expired()) return { streams: [] };
 
-  try {
-    const targetEpisode = episodeInfo?.episode ?? null;
+  const targetEpisode = episodeInfo?.episode ?? null;
 
-    const candidates: Candidate[] = [];
-    const collected = await withTimeout<string>(
-      collectCandidates(releaseId, targetEpisode, candidates).then(() => "done"),
-      remaining(),
-      "deadline",
-    );
-    debug(args.id, "candidates", candidates.length, collected, "after", Date.now() - started, "ms");
+  const candidates: Candidate[] = [];
+  const collected = await withTimeout<string>(
+    collectCandidates(releaseId, targetEpisode, candidates, expired).then(() => "done"),
+    timeLeft(),
+    "deadline",
+    `collect ${args.id}`,
+  );
+  debug(args.id, "candidates", candidates.length, collected, elapsed());
+  if (expired()) return { streams: [] };
 
-    // Several dubbers (typically subtitle groups) point at the same player URL; resolve it once.
-    const seen = new Set<string>();
-    const unique = candidates
-      .sort((a, b) => a.order - b.order)
-      .filter((c) => (seen.has(c.url) ? false : (seen.add(c.url), true)))
-      .slice(0, MAX_STREAMS);
+  // Several dubbers (typically subtitle groups) point at the same player URL; resolve it once.
+  const seen = new Set<string>();
+  const unique = candidates
+    .sort(byOrder)
+    .filter((c) => (seen.has(c.url) ? false : (seen.add(c.url), true)));
 
-    const resolved: Array<{ order: number; stream: Stream }> = [];
-    const finished = await withTimeout<string>(
-      mapLimit(unique, CONCURRENCY, async (c) => {
-        const stream = await withTimeout(resolveStream(c.label, c.url), STEP_TIMEOUT_MS, null);
-        if (stream) {
-          stream.behaviorHints = { group: String(c.dubberId) };
-          resolved.push({ order: c.order, stream });
-        } else {
-          debug(args.id, "no stream:", c.label, c.url.slice(0, 70));
-        }
-      }).then(() => "done"),
-      remaining(),
-      "deadline",
-    );
-    debug(args.id, "streams", resolved.length, "of", unique.length, finished, "after", Date.now() - started, "ms");
+  // Candidates are tried in order until MAX_STREAMS have actually resolved (or time runs out).
+  const resolved: Array<{ candidate: Candidate; stream: Stream }> = [];
+  const finished = await withTimeout<string>(
+    mapLimit(unique, CONCURRENCY, async (c) => {
+      const stream = await withTimeout(resolveStream(c.label, c.url), STEP_TIMEOUT_MS, null, `resolve ${c.label}`);
+      if (stream) {
+        stream.behaviorHints = { group: String(c.dubberId) };
+        resolved.push({ candidate: c, stream });
+      } else {
+        debug(args.id, "no stream:", c.label, c.url.slice(0, 70));
+      }
+    }, () => expired() || resolved.length >= MAX_STREAMS).then(() => "done"),
+    timeLeft(),
+    "deadline",
+    `streams ${args.id}`,
+  );
+  debug(args.id, "streams", resolved.length, "of", unique.length, finished, elapsed());
 
-    return { streams: resolved.sort((a, b) => a.order - b.order).map((r) => r.stream) };
-  } catch (err) {
-    console.error("Stream error:", err);
-    return { streams: [] };
-  }
+  return {
+    streams: resolved
+      .sort((a, b) => byOrder(a.candidate, b.candidate))
+      .slice(0, MAX_STREAMS)
+      .map((r) => r.stream),
+  };
 }
